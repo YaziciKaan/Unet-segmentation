@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+env/
+venv/
+ENV/
+
+# Models & Checkpoints
+checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# Data
+*.mp4
+*.avi
+*.jpg
+*.jpeg
+*.png
+saved_images/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
