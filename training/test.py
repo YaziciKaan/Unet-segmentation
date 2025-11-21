@@ -6,221 +6,273 @@ from PIL import Image
 import cv2
 import os
 import argparse
-from tqdm import tqdm
+import time
 
 from model import UNet
+from train import IMAGE_HEIGHT, IMAGE_WIDTH
+
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
 
 
-# Hyperparameters
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-IMAGE_HEIGHT = 160
-IMAGE_WIDTH = 240
 
 
-def load_model(checkpoint_path, device=DEVICE):
-    """Load trained model from checkpoint."""
-    model = UNet(in_channels=3, out_channels=1).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
-    print(f"=> Model loaded from {checkpoint_path}")
-    if "dice_score" in checkpoint:
-        print(f"=> Model Dice Score: {checkpoint['dice_score']:.4f}")
-    return model
-
-
-def get_transform():
-    """Get transformation for inference."""
-    return A.Compose([
-        A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
-        A.Normalize(
-            mean=[0.0, 0.0, 0.0],
-            std=[1.0, 1.0, 1.0],
-            max_pixel_value=255.0,
-        ),
-        ToTensorV2(),
-    ])
-
-
-def predict_image(model, image_path, output_path, device=DEVICE, overlay=True):
-    """
-    Predict segmentation mask for a single image.
-    
-    Args:
-        model: Trained model
-        image_path: Path to input image
-        output_path: Path to save output
-        device: Device to run on
-        overlay: Whether to overlay mask on original image
-    """
-    # Load and preprocess image
-    original_image = Image.open(image_path).convert("RGB")
-    original_size = original_image.size
-    image = np.array(original_image)
-    
-    transform = get_transform()
-    augmented = transform(image=image)
-    image_tensor = augmented["image"].unsqueeze(0).to(device)
-    
-    # Predict
-    with torch.no_grad():
-        pred = torch.sigmoid(model(image_tensor))
-        pred = (pred > 0.5).float()
-    
-    # Convert to numpy and resize to original size
-    mask = pred.squeeze().cpu().numpy()
-    mask = (mask * 255).astype(np.uint8)
-    mask = cv2.resize(mask, original_size, interpolation=cv2.INTER_NEAREST)
-    
-    # Save results
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-    
-    if overlay:
-        # Create overlay visualization
-        original_np = np.array(original_image)
-        colored_mask = np.zeros_like(original_np)
-        colored_mask[:, :, 0] = mask  # Red channel for mask
+class ModelWrapper:
+    def __init__(self, model_path, device=DEVICE):
+        self.model_path = model_path
+        self.device = device
+        self.model_type = self._detect_model_type()
+        self.fps_history = []
         
-        # Blend original image with mask
-        alpha = 0.5
-        overlay_img = cv2.addWeighted(original_np, 1-alpha, colored_mask, alpha, 0)
+        if self.model_type == "pytorch":
+            self._load_pytorch_model()
+        elif self.model_type == "onnx":
+            self._load_onnx_model()
+        else:
+            raise ValueError(f"Unsupported model format: {model_path}")
+    
+    def _detect_model_type(self):
+        ext = os.path.splitext(self.model_path)[1].lower()
+        if ext in ['.pth', '.pt']:
+            return "pytorch"
+        elif ext == '.onnx':
+            if not ONNX_AVAILABLE:
+                raise ImportError("ONNX model detected but onnxruntime not installed!")
+            return "onnx"
+        else:
+            return None
+    
+    def _load_pytorch_model(self):
+        self.model = UNet(in_channels=3, out_channels=1).to(self.device)
+        checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.model.eval()
         
-        Image.fromarray(overlay_img).save(output_path)
-        print(f"=> Saved overlay result to {output_path}")
-    else:
-        Image.fromarray(mask).save(output_path)
-        print(f"=> Saved mask to {output_path}")
-
-
-def predict_images(model, input_dir, output_dir, device=DEVICE, overlay=True):
-    """
-    Predict segmentation masks for all images in a directory.
-    
-    Args:
-        model: Trained model
-        input_dir: Directory containing input images
-        output_dir: Directory to save outputs
-        device: Device to run on
-        overlay: Whether to overlay mask on original images
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get all image files
-    image_files = [f for f in os.listdir(input_dir) 
-                   if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
-    
-    print(f"Found {len(image_files)} images")
-    
-    for img_file in tqdm(image_files, desc="Processing images"):
-        input_path = os.path.join(input_dir, img_file)
-        output_path = os.path.join(output_dir, img_file)
+        self.transform = A.Compose([
+            A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
+            A.Normalize(mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0], max_pixel_value=255.0),
+            ToTensorV2(),
+        ])
         
-        try:
-            predict_image(model, input_path, output_path, device, overlay)
-        except Exception as e:
-            print(f"Error processing {img_file}: {str(e)}")
-
-
-def predict_video(model, video_path, output_path, device=DEVICE, overlay=True):
-    """
-    Predict segmentation masks for video.
+        print(f"✓ PyTorch model loaded (Device: {self.device})")
+        if "dice_score" in checkpoint:
+            print(f"  Dice Score: {checkpoint['dice_score']:.4f}")
     
-    Args:
-        model: Trained model
-        video_path: Path to input video
-        output_path: Path to save output video
-        device: Device to run on
-        overlay: Whether to overlay mask on original video
-    """
-    # Open video
+    def _load_onnx_model(self):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self.session = ort.InferenceSession(self.model_path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        actual_provider = self.session.get_providers()[0]
+        print(f"✓ ONNX model loaded (Provider: {actual_provider})")
+    
+    def predict(self, frame):
+        start_time = time.time()
+        
+        if self.model_type == "pytorch":
+            mask = self._predict_pytorch(frame)
+        else:
+            mask = self._predict_onnx(frame)
+        
+        inference_time = time.time() - start_time
+        fps = 1.0 / inference_time if inference_time > 0 else 0
+        self.fps_history.append(fps)
+        
+        return mask, fps
+    
+    def _predict_pytorch(self, frame):
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        augmented = self.transform(image=frame_rgb)
+        image_tensor = augmented["image"].unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            pred = torch.sigmoid(self.model(image_tensor))
+            pred = (pred > 0.5).float()
+        
+        mask = pred.squeeze().cpu().numpy()
+        mask = (mask * 255).astype(np.uint8)
+        return mask
+    
+    def _predict_onnx(self, frame):
+        frame_resized = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT))
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        frame_normalized = frame_rgb.astype(np.float32) / 255.0
+        frame_input = np.transpose(frame_normalized, (2, 0, 1))
+        frame_input = np.expand_dims(frame_input, axis=0)
+        
+        outputs = self.session.run(None, {self.input_name: frame_input})
+        mask_output = outputs[0]
+        
+        mask = 1 / (1 + np.exp(-mask_output))
+        mask = (mask > 0.5).astype(np.float32)
+        mask = mask.squeeze()
+        mask = (mask * 255).astype(np.uint8)
+        return mask
+    
+    def get_avg_fps(self):
+        return np.mean(self.fps_history) if self.fps_history else 0
+
+
+def predict_video_realtime(model_wrapper, video_path, output_path=None, show_gui=True):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
         return
     
-    # Get video properties
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps_orig = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    print(f"\nVideo: {width}x{height} @ {fps_orig} FPS, {total_frames} frames")
+    print(f"Model: {model_wrapper.model_type.upper()}")
     
-    transform = get_transform()
+    gui_available = show_gui
+    if show_gui:
+        try:
+            test_window = 'opencv_test_window'
+            cv2.namedWindow(test_window, cv2.WINDOW_NORMAL)
+            cv2.destroyWindow(test_window)
+            print("GUI mode - Press 'q' to quit, 's' to screenshot\n")
+        except (cv2.error, Exception):
+            gui_available = False
+            print("⚠️  GUI not available (headless/SSH mode). Running without display.\n")
     
-    print(f"Processing video: {total_frames} frames at {fps} FPS")
+    out = None
+    if output_path:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps_orig, (width, height))
     
-    for _ in tqdm(range(total_frames), desc="Processing video"):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Preprocess
-        augmented = transform(image=frame_rgb)
-        image_tensor = augmented["image"].unsqueeze(0).to(device)
-        
-        # Predict
-        with torch.no_grad():
-            pred = torch.sigmoid(model(image_tensor))
-            pred = (pred > 0.5).float()
-        
-        # Convert to numpy and resize
-        mask = pred.squeeze().cpu().numpy()
-        mask = (mask * 255).astype(np.uint8)
-        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-        
-        if overlay:
-            # Create visualization
-            colored_mask = np.zeros_like(frame)
-            colored_mask[:, :, 2] = mask  # Red channel (BGR format)
+    frame_count = 0
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            # Blend
+            frame_count += 1
+            
+            # Predict
+            mask, fps = model_wrapper.predict(frame)
+            
+            # Resize mask to original size
+            mask_resized = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            
+            # Create overlay
+            colored_mask = np.zeros_like(frame)
+            colored_mask[:, :, 2] = mask_resized  # Red channel (BGR)
             alpha = 0.5
             overlay_frame = cv2.addWeighted(frame, 1-alpha, colored_mask, alpha, 0)
-            out.write(overlay_frame)
-        else:
-            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            out.write(mask_bgr)
+            
+            # Add FPS
+            cv2.putText(overlay_frame, f"FPS: {fps:.1f} | Frame: {frame_count}/{total_frames}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(overlay_frame, f"Model: {model_wrapper.model_type.upper()}", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            # Save to video
+            if out:
+                out.write(overlay_frame)
+            
+            # Show GUI
+            if gui_available:
+                try:
+                    cv2.imshow('Segmentation - Press q to quit', overlay_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
+                    elif key == ord('s'):
+                        screenshot_path = f"screenshot_{frame_count}.jpg"
+                        cv2.imwrite(screenshot_path, overlay_frame)
+                        print(f"✓ Screenshot saved: {screenshot_path}")
+                except (cv2.error, Exception):
+                    gui_available = False
+                    print("\n⚠️  GUI error - switching to headless mode")
+            
+            if not gui_available and frame_count % 50 == 0:
+                print(f"Processed {frame_count}/{total_frames} frames - {fps:.1f} FPS")
     
-    cap.release()
-    out.release()
-    print(f"=> Saved output video to {output_path}")
+    except KeyboardInterrupt:
+        print("\n\nStopped by user")
+    
+    finally:
+        cap.release()
+        if out:
+            out.release()
+        if gui_available:
+            try:
+                cv2.destroyAllWindows()
+            except (cv2.error, Exception):
+                pass
+        
+        print(f"\n{'='*60}")
+        print(f"Processed {frame_count} frames")
+        print(f"Average FPS: {model_wrapper.get_avg_fps():.2f}")
+        print(f"Average Inference Time: {1000/model_wrapper.get_avg_fps():.2f} ms")
+        print('='*60)
+        
+        if output_path:
+            print(f"\n✓ Output saved: {output_path}")
+
+
+def predict_image(model_wrapper, image_path, output_path, overlay=True):
+    original_image = cv2.imread(image_path)
+    if original_image is None:
+        print(f"Error: Could not load image {image_path}")
+        return
+    
+    mask, fps = model_wrapper.predict(original_image)
+    
+    h, w = original_image.shape[:2]
+    mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    if overlay:
+        colored_mask = np.zeros_like(original_image)
+        colored_mask[:, :, 2] = mask_resized
+        alpha = 0.5
+        result = cv2.addWeighted(original_image, 1-alpha, colored_mask, alpha, 0)
+    else:
+        result = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
+    
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    cv2.imwrite(output_path, result)
+    print(f"✓ Saved: {output_path} (FPS: {fps:.1f})")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="UNET Segmentation Inference")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pth",
-                        help="Path to model checkpoint")
-    parser.add_argument("--mode", type=str, choices=["image", "images", "video"], required=True,
-                        help="Inference mode: single image, multiple images, or video")
+    parser = argparse.ArgumentParser(description="UNET Segmentation Inference (PyTorch or ONNX)")
+    parser.add_argument("--model", type=str, required=True,
+                        help="Path to model (.pth for PyTorch, .onnx for ONNX)")
+    parser.add_argument("--mode", type=str, choices=["image", "video"], required=True,
+                        help="Inference mode")
     parser.add_argument("--input", type=str, required=True,
-                        help="Input image/video path or directory")
-    parser.add_argument("--output", type=str, required=True,
-                        help="Output path or directory")
+                        help="Input image or video path")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output path (optional)")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="Disable GUI for video mode")
     parser.add_argument("--no-overlay", action="store_true",
-                        help="Save only mask without overlay")
+                        help="Save only mask without overlay (image mode)")
     
     args = parser.parse_args()
     
     # Load model
-    model = load_model(args.checkpoint, DEVICE)
+    print(f"\nLoading model: {args.model}")
+    print("="*60)
+    model_wrapper = ModelWrapper(args.model)
+    print("="*60)
     
-    # Run inference based on mode
-    overlay = not args.no_overlay
-    
+    # Run inference
     if args.mode == "image":
-        predict_image(model, args.input, args.output, DEVICE, overlay)
-    elif args.mode == "images":
-        predict_images(model, args.input, args.output, DEVICE, overlay)
+        output = args.output or "output.jpg"
+        predict_image(model_wrapper, args.input, output, not args.no_overlay)
     elif args.mode == "video":
-        predict_video(model, args.input, args.output, DEVICE, overlay)
-    
-    print("\n✅ Inference completed!")
+        show_gui = not args.no_gui
+        predict_video_realtime(model_wrapper, args.input, args.output, show_gui)
 
 
 if __name__ == "__main__":
