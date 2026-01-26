@@ -6,9 +6,9 @@ from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from model import UNet
+from app.model import UNet
 from dataset import SegmentationDataset
-from utils import (
+from app.utils import (
     save_checkpoint,
     check_accuracy,
 )
@@ -16,11 +16,11 @@ from utils import (
 # Hyperparameters
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_EPOCHS = 150
 NUM_WORKERS = 2
-IMAGE_HEIGHT = 160
-IMAGE_WIDTH = 240
+IMAGE_HEIGHT = 288
+IMAGE_WIDTH = 512
 PIN_MEMORY = True
 LOAD_MODEL = False
 TRAIN_IMG_DIR = "/home/kaan/datasets/Pothole_Segmentation/train/images/"
@@ -64,7 +64,7 @@ def train_fn(loader, model, optimizer, loss_fn, scaler):
 def main():
     # Define transforms for training
     train_transform = A.Compose([
-        A.Resize(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
+        A.RandomCrop(height=IMAGE_HEIGHT, width=IMAGE_WIDTH),
         A.Rotate(limit=35, p=1.0),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.1),

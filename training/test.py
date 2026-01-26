@@ -8,7 +8,7 @@ import os
 import argparse
 import time
 
-from model import UNet
+from app.model import UNet
 from train import IMAGE_HEIGHT, IMAGE_WIDTH
 
 try:
@@ -245,8 +245,8 @@ def predict_image(model_wrapper, image_path, output_path, overlay=True):
 
 def main():
     parser = argparse.ArgumentParser(description="UNET Segmentation Inference (PyTorch or ONNX)")
-    parser.add_argument("--model", type=str, required=True,
-                        help="Path to model (.pth for PyTorch, .onnx for ONNX)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to model (.pth for PyTorch, .onnx for ONNX). Default: ../pothole_unet.onnx")
     parser.add_argument("--mode", type=str, choices=["image", "video"], required=True,
                         help="Inference mode")
     parser.add_argument("--input", type=str, required=True,
@@ -259,6 +259,11 @@ def main():
                         help="Save only mask without overlay (image mode)")
     
     args = parser.parse_args()
+    
+    # Default to ONNX model if not specified
+    if args.model is None:
+        args.model = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pothole_unet.onnx")
+        print(f"No model specified, using default: {args.model}")
     
     # Load model
     print(f"\nLoading model: {args.model}")
