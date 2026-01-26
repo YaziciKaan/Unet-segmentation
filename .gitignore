@@ -15,14 +15,18 @@ checkpoints/
 *.pth
 *.pt
 *.onnx
+*.onnx.data
+models/
 
 # Data
 *.mp4
 *.avi
+*.mjpeg
 *.jpg
 *.jpeg
 *.png
 saved_images/
+training/data/
 
 # IDE
 .vscode/
