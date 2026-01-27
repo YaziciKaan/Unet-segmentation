@@ -9,7 +9,9 @@ import argparse
 import time
 
 from app.model import UNet
-from train import IMAGE_HEIGHT, IMAGE_WIDTH
+
+IMAGE_HEIGHT = 288
+IMAGE_WIDTH = 512
 
 try:
     import onnxruntime as ort
@@ -58,7 +60,7 @@ class ModelWrapper:
             ToTensorV2(),
         ])
         
-        print(f"✓ PyTorch model loaded (Device: {self.device})")
+        print(f"PyTorch model loaded (Device: {self.device})")
         if "dice_score" in checkpoint:
             print(f"  Dice Score: {checkpoint['dice_score']:.4f}")
     
@@ -139,7 +141,7 @@ def predict_video_realtime(model_wrapper, video_path, output_path=None, show_gui
             print("GUI mode - Press 'q' to quit, 's' to screenshot\n")
         except (cv2.error, Exception):
             gui_available = False
-            print("⚠️  GUI not available (headless/SSH mode). Running without display.\n")
+            print("GUI not available (headless/SSH mode). Running without display.\n")
     
     out = None
     if output_path:
@@ -191,7 +193,7 @@ def predict_video_realtime(model_wrapper, video_path, output_path=None, show_gui
                         print(f"✓ Screenshot saved: {screenshot_path}")
                 except (cv2.error, Exception):
                     gui_available = False
-                    print("\n⚠️  GUI error - switching to headless mode")
+                    print("\nGUI error - switching to headless mode")
             
             if not gui_available and frame_count % 50 == 0:
                 print(f"Processed {frame_count}/{total_frames} frames - {fps:.1f} FPS")
@@ -209,14 +211,12 @@ def predict_video_realtime(model_wrapper, video_path, output_path=None, show_gui
             except (cv2.error, Exception):
                 pass
         
-        print(f"\n{'='*60}")
         print(f"Processed {frame_count} frames")
         print(f"Average FPS: {model_wrapper.get_avg_fps():.2f}")
         print(f"Average Inference Time: {1000/model_wrapper.get_avg_fps():.2f} ms")
-        print('='*60)
         
         if output_path:
-            print(f"\n✓ Output saved: {output_path}")
+            print(f"\nOutput saved: {output_path}")
 
 
 def predict_image(model_wrapper, image_path, output_path, overlay=True):
@@ -240,7 +240,7 @@ def predict_image(model_wrapper, image_path, output_path, overlay=True):
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     cv2.imwrite(output_path, result)
-    print(f"✓ Saved: {output_path} (FPS: {fps:.1f})")
+    print(f"Saved: {output_path} (FPS: {fps:.1f})")
 
 
 def main():
